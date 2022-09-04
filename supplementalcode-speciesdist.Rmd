@@ -1,0 +1,360 @@
+---
+title: "SA Species Sensitivity"
+author: "Kathryn Sokolowski"
+date: '2022-06-29'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+load packages
+```{r}
+library(here)
+library(viridis)
+library(randomForest)
+library(colorspace)
+library(gam)
+library(viridis) #the best colors
+library(scales) #alpha transparency
+library(mgcv) #Wood's implementation of generalized additive models
+library(randomForest)
+library(tidyverse)
+library(dplyr)
+library(tibble)
+library(ggforce)
+```
+
+Dataset has been cut down from full to only include Southern African countries. Sooo while this might be a bad idea, it at least eliminates huge equatorial geography problems. 
+
+Using Hempson's models of herbivore biomass we take that model to turn it into present vs absent. Those present/absent values are tied to 0.5 degree sections across South Africa. Then these are matched to those corresponding worldclim values. So instead of being based around the specific locality, it is modeled across all of South Africa. Also add aridity in. 
+
+```{r}
+Hempson <- here("Data", "Hempson-Venter-Updated.csv") %>% 
+  read_csv()  %>%
+  na.omit() 
+
+min(Hempson$bio1)
+max(Hempson$bio1)
+min(Hempson$mean_wc)
+max(Hempson$mean_wc)
+min(Hempson$bio15)
+max(Hempson$bio15)
+
+as_factor(Hempson)
+```
+
+Check for correlates
+```{r}
+env <- here("Data", "southafrica-wide-env.csv") %>% 
+  na.omit() %>%
+  read_csv()
+
+corenvironment <- env %>%
+  select(Longitude, Latitude, mean_wc, AridityIndex, Bio1, Bio6, Bio15) %>%
+  na.omit()
+cor(corenvironment)
+```
+
+Do random forest models with updated Hempson data
+```{r}
+
+Hempson <- Hempson %>% 
+  select(Latitude, Longitude, mean_wc, AridityIndex, Bio1, Bio6, Bio15, Species, Present)
+
+set.seed(50)
+rf <- randomForest(Present~ ., data = Hempson, mtry = best.m, importance=TRUE, ntree = 500)
+print(rf)
+
+mtry <- tuneRF(Hempson1[-1],Hempson1$Present, ntreeTry=500,
+               stepFactor=1.5,improve=0.01, trace=TRUE, plot=TRUE)
+best.m <- mtry[mtry[, 2] == min(mtry[, 2]), 1]
+print(mtry)
+print(best.m)
+
+#Evaluate variable importance
+importance(rf)
+varImpPlot(rf)
+print(rf)
+
+
+imp <- varImpPlot(rf)
+imp <- as.data.frame(imp)
+imp$varnames <- rownames(imp)
+rownames(imp) <- NULL
+imp$var_categ <- rep(1:2, 4)
+
+write.csv(imp, "/Users/kathrynsokolowski/Desktop/meansq.csv")
+imp <- read.csv("/Users/kathrynsokolowski/Desktop/meansq1.csv")
+
+
+
+imp <- imp %>%
+  arrange(IncMSE) %>%
+  mutate(varnames=factor(varnames, levels=varnames))
+
+  
+p <- ggplot(imp, aes(y=IncMSE, x=varnames)) + 
+    geom_segment(aes(xend=varnames, yend=0), size =3, color = "red") +
+   geom_point(size= 7, color="red")  +
+   ylab("% Mean Square Error") +
+  coord_flip() + 
+  theme_minimal() +
+    labs(title="Variable importance") +
+   scale_x_discrete(labels=function(x) gsub("_", " ", x, fixed=TRUE))+
+   theme(plot.title=element_text(hjust=0.5), text = element_text(size=30))
+
+
+jpeg(
+  filename="meansq1.jpg",
+  width=8,
+  height=8,
+  units="in",
+  res=500)
+
+
+
+```
+
+
+```{r}
+summary(rf)
+
+```
+Check on GAM as null model
+```{r}
+n_distinct(Hempson$Species)
+as_factor(Hempson)
+
+Hempson$Species <- as.factor(Hempson$Species)
+
+Hempson$Species <- as.numeric(Hempson$Species)
+Species <- Hempson$Species 
+summary(Species)
+
+class(Hempson$Species)
+
+mod.gam <- gam(Present ~ s(Species) + s(Latitude) +s(Longitude) + s(mean_wc) + s(Bio1) + s(Bio6) + s(Bio15) + s(AridityIndex), method = "GCV.Cp",data = Hempson) 
+
+summary(mod.gam) #model summary
+
+
+```
+
+
+Aridity Probabilty of presence
+```{r}
+
+# Aridity -----------------------------------------------------------------
+
+min(Hempson$AridityIndex)
+max(Hempson$AridityIndex)
+
+Species <- unique(Hempson$Species) #make a list of all Species in the data.frame
+
+predict.wc <- tibble(
+  AridityIndex = seq(500, 10000, length = 100)
+) #range of environmental variable for prediction
+
+rf.Species.dist <- as_tibble(
+  matrix(nrow = nrow(predict.wc), ncol = length(Species))
+) #make a blank data.frame to hold the output
+
+#add Species name to each column of the output
+colnames(rf.Species.dist) <- Species 
+
+set.seed(49)#ers <-that's for Tyler #set arbitrary seed so results are consistent
+
+for (i in Species) {
+  
+  suppressWarnings(
+    mod.rf <- randomForest(
+      Present ~ AridityIndex
+      data = subset(Hempson, Species == i),
+      replace = TRUE, # bootstrap re-sample each run
+      sampsize = 15, # down sample to balance pres/abs
+      na.action = na.omit # omit missing data, but could impute: na.roughfix = median or rfimpute = proximity based
+    ) 
+  )
+  
+  rf.Species.dist[, i] <- predict(
+    mod.rf,                #predict model fit
+    newdata = predict.wc,  #across the range of predictor data
+    type = 'response'      #output on response scale (0,1)
+    #predict.all=TRUE,     #returns list with a fit for each tree, which could be useful later
+  )
+  
+  remove(mod.rf)
+  
+}
+
+rf.Species.dist <- rf.Species.dist %>%
+  as_tibble() %>%
+  mutate(
+    AridityIndex = predict.wc$AridityIndex
+  ) %>%
+  pivot_longer(
+    -AridityIndex, 
+    names_to = "Species", 
+    values_to = "Present"
+  ) %>%
+  arrange(Species) %>%
+  select(Species, AridityIndex, Present)
+
+Species_response_plots1 <- 
+  ggplot(rf.Species.dist, aes(AridityIndex, Present)) +
+  geom_line() +
+  facet_wrap_paginate(~Species, ncol = 1, nrow =1, page = 1) +
+  theme_bw() 
+
+
+
+Species_response_plots1
+```
+
+Woody cover response
+
+
+```{r}
+Woody Cover -------------------------------------------------------------
+min(Hempson$mean_wc)
+max(Hempson$mean_wc)
+
+Species <- unique(Hempson$Species) #make a list of all Species in the data.frame
+
+predict.wc <- tibble(
+  mean_wc = seq(0, 1, length = 100)
+) #range of environmental variable for prediction
+
+rf.Species.dist <- as_tibble(
+  matrix(nrow = nrow(predict.wc), ncol = length(Species))
+) #make a blank data.frame to hold the output
+
+#add Species name to each column of the output
+colnames(rf.Species.dist) <- Species 
+
+set.seed(49)#ers <-that's for Tyler #set arbitrary seed so results are consistent
+
+for (i in Species) {
+  
+  suppressWarnings(
+    mod.rf <- randomForest(
+      Present ~ mean_wc,
+      data = subset(Hempson, Species == i),
+      replace = TRUE, # bootstrap re-sample each run
+      sampsize = 15, # down sample to balance pres/abs
+      na.action = na.omit # omit missing data, but could impute: na.roughfix = median or rfimpute = proximity based
+    ) 
+  )
+  
+  rf.Species.dist[, i] <- predict(
+    mod.rf,                #predict model fit
+    newdata = predict.wc,  #across the range of predictor data
+    type = 'response'      #output on response scale (0,1)
+    #predict.all=TRUE,     #returns list with a fit for each tree, which could be useful later
+  )
+  
+  remove(mod.rf)
+  
+}
+
+rf.Species.dist <- rf.Species.dist %>%
+  as_tibble() %>%
+  mutate(
+    mean_wc = predict.wc$mean_wc
+  ) %>%
+  pivot_longer(
+    -mean_wc, 
+    names_to = "Species", 
+    values_to = "Present"
+  ) %>%
+  arrange(Species) %>%
+  select(Species, mean_wc, Present)
+
+Species_response_plots1 <- 
+  ggplot(rf.Species.dist, aes(mean_wc, Present)) +
+  geom_line() +
+  facet_wrap_paginate(~Species, ncol = 3, nrow =4, page = 1) +
+  theme_bw() 
+
+Species_response_plots1
+```
+Precipitation seasonality
+
+```{r}
+
+
+min(Hempson$Bio15)
+max(Hempson$Bio15)
+
+Species <- unique(Hempson$Species) #make a list of all Species in the data.frame
+
+predict.wc <- tibble(
+  Bio15 = seq(10, 150, length = 100)
+) #range of environmental variable for prediction
+
+rf.Species.dist <- as_tibble(
+  matrix(nrow = nrow(predict.wc), ncol = length(Species))
+) #make a blank data.frame to hold the output
+
+#add Species name to each column of the output
+colnames(rf.Species.dist) <- Species 
+
+set.seed(49)#ers <-that's for Tyler #set arbitrary seed so results are consistent
+
+for (i in Species) {
+  
+  suppressWarnings(
+    mod.rf <- randomForest(
+      Present ~ Bio15,
+      data = subset(Hempson, Species == i),
+      replace = TRUE, # bootstrap re-sample each run
+      sampsize = 15, # down sample to balance pres/abs
+      na.action = na.omit # omit missing data, but could impute: na.roughfix = median or rfimpute = proximity based
+    ) 
+  )
+  
+  rf.Species.dist[, i] <- predict(
+    mod.rf,                #predict model fit
+    newdata = predict.wc,  #across the range of predictor data
+    type = 'response'      #output on response scale (0,1)
+    #predict.all=TRUE,     #returns list with a fit for each tree, which could be useful later
+  )
+  
+  remove(mod.rf)
+  
+}
+
+rf.Species.dist <- rf.Species.dist %>%
+  as_tibble() %>%
+  mutate(
+    Bio15 = predict.wc$Bio15
+  ) %>%
+  pivot_longer(
+    -Bio15, 
+    names_to = "Species", 
+    values_to = "Present"
+  ) %>%
+  arrange(Species) %>%
+  select(Species, Bio15, Present)
+
+
+Species_response_plots1 <- 
+  ggplot(rf.Species.dist, aes(Bio15, Present)) +
+  geom_line() +
+
+  facet_wrap_paginate(~Species, ncol = 1, nrow =1, page = 1) +
+  theme_bw() 
+
+
+Species_response_plots1 <- 
+  ggplot(rf.Species.dist, aes(Bio15, Present)) +
+  geom_line() +
+  facet_wrap_paginate(~Species, ncol = 3, nrow =4, page = 1) +
+  theme_bw() 
+
+
+Species_response_plots1
+
+
